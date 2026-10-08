@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Site survey</name>
+    <Folder>
+      <name>Plots</name>
+      <Placemark>
+        <name>Plot A</name>
+        <description>Northern plot</description>
+        <Polygon>
+          <outerBoundaryIs>
+            <LinearRing>
+              <coordinates>
+                80.5000,16.5000,0 80.5010,16.5000,0 80.5010,16.5010,0 80.5000,16.5010,0 80.5000,16.5000,0
+              </coordinates>
+            </LinearRing>
+          </outerBoundaryIs>
+        </Polygon>
+      </Placemark>
+    </Folder>
+    <Folder>
+      <name>Roads</name>
+      <Placemark>
+        <name>Access road</name>
+        <LineString>
+          <coordinates>80.5000,16.5000,0 80.5100,16.5000,0</coordinates>
+        </LineString>
+      </Placemark>
+    </Folder>
+    <Placemark>
+      <name>Gate</name>
+      <Point><coordinates>80.5000,16.5000,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Marker with route</name>
+      <MultiGeometry>
+        <Point><coordinates>80.5000,16.5000,0</coordinates></Point>
+        <LineString><coordinates>80.5000,16.5000,0 80.5100,16.5000,0</coordinates></LineString>
+      </MultiGeometry>
+    </Placemark>
+  </Document>
+</kml>
