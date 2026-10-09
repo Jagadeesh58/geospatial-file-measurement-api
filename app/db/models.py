@@ -3,22 +3,26 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from geoalchemy2 import Geometry
 from sqlalchemy import (
-    JSON,
+    BigInteger,
+    CheckConstraint,
     DateTime,
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.engine import Dialect
-from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.types import TypeDecorator
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
+
+WGS84_SRID = 4326
 
 
 class FileType(StrEnum):
@@ -26,10 +30,7 @@ class FileType(StrEnum):
     SHAPEFILE = "shapefile"
 
 
-class FileStatus(StrEnum):
-    # PENDING is part of the public status vocabulary for when processing moves to a
-    # background task. Uploads are processed inside the request today, so a client
-    # only ever observes PROCESSING (if the process died mid-request), COMPLETED or FAILED.
+class ProcessingStatus(StrEnum):
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
@@ -48,65 +49,109 @@ class MeasurementType(StrEnum):
     LENGTH = "length"
 
 
-class UTCDateTime(TypeDecorator[datetime]):
-    """Stores UTC timestamps; SQLite drops tzinfo, so it is restored on read."""
-
-    impl = DateTime
-    cache_ok = True
-
-    def process_bind_param(self, value: datetime | None, dialect: Dialect) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None:
-            raise ValueError("Timestamps must be timezone-aware.")
-        return value.astimezone(UTC).replace(tzinfo=None)
-
-    def process_result_value(self, value: datetime | None, dialect: Dialect) -> datetime | None:
-        return None if value is None else value.replace(tzinfo=UTC)
-
-
 def _enum_column(enum_class: type[StrEnum]) -> Enum:
-    # Persist the enum values ("kml") rather than member names ("KML").
+    # Persist the enum values ("kml") rather than member names ("KML"). Allowed values are
+    # enforced by the named CHECK constraints below, which the migration mirrors.
     return Enum(
         enum_class,
         native_enum=False,
+        create_constraint=False,
         length=20,
         values_callable=lambda members: [member.value for member in members],
     )
 
 
-def _new_file_id() -> str:
+def _status_check(table: str, enum_class: type[StrEnum]) -> CheckConstraint:
+    allowed = ", ".join(f"'{member.value}'" for member in enum_class)
+    return CheckConstraint(f"status IN ({allowed})", name=f"ck_{table}_status")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _new_id() -> str:
     return uuid.uuid4().hex
 
 
 class UploadedFile(Base):
     __tablename__ = "uploaded_files"
+    __table_args__ = (
+        _status_check("uploaded_files", ProcessingStatus),
+        CheckConstraint("feature_count >= 0", name="ck_uploaded_files_feature_count"),
+    )
 
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_file_id)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
     filename: Mapped[str] = mapped_column(String(255))
     file_type: Mapped[FileType] = mapped_column(_enum_column(FileType))
-    status: Mapped[FileStatus] = mapped_column(_enum_column(FileStatus))
+    status: Mapped[ProcessingStatus] = mapped_column(_enum_column(ProcessingStatus))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    # Internal name under the upload directory; never exposed through the API.
+    storage_name: Mapped[str] = mapped_column(String(64))
     feature_count: Mapped[int] = mapped_column(Integer, default=0)
     crs: Mapped[str | None] = mapped_column(String(255))
     error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=lambda: datetime.now(UTC))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
+    )
+
+    job: Mapped["ProcessingJob | None"] = relationship(
+        back_populates="file", uselist=False, lazy="joined"
+    )
+
+    @property
+    def job_id(self) -> str | None:
+        return self.job.id if self.job else None
 
 
-class FeatureMeasurement(Base):
-    __tablename__ = "feature_measurements"
-    __table_args__ = (UniqueConstraint("file_id", "feature_index"),)
+class ProcessingJob(Base):
+    __tablename__ = "processing_jobs"
+    __table_args__ = (_status_check("processing_jobs", ProcessingStatus),)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    file_id: Mapped[str] = mapped_column(ForeignKey("uploaded_files.id"), index=True)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
+    file_id: Mapped[str] = mapped_column(
+        ForeignKey("uploaded_files.id", ondelete="CASCADE"), unique=True
+    )
+    status: Mapped[ProcessingStatus] = mapped_column(_enum_column(ProcessingStatus))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_dispatch_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    file: Mapped[UploadedFile] = relationship(back_populates="job")
+
+
+class Feature(Base):
+    """One feature of an uploaded file together with its measurement or failure reason."""
+
+    __tablename__ = "features"
+    __table_args__ = (
+        UniqueConstraint("file_id", "feature_index", name="uq_features_file_id_feature_index"),
+        Index("ix_features_file_id_status", "file_id", "status"),
+        Index("ix_features_geom", "geom", postgresql_using="gist"),
+        _status_check("features", FeatureStatus),
+        CheckConstraint("feature_index >= 0", name="ck_features_feature_index"),
+        CheckConstraint("value IS NULL OR value >= 0", name="ck_features_value"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    file_id: Mapped[str] = mapped_column(ForeignKey("uploaded_files.id", ondelete="CASCADE"))
     feature_index: Mapped[int] = mapped_column(Integer)
     geometry_type: Mapped[str | None] = mapped_column(String(50))
-    # GeoJSON-style geometry in the file's own CRS; kept so the API can return it.
-    geometry: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # GeoJSON in the file's own CRS, returned as uploaded.
+    geometry: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # WGS 84 copy of the same geometry, kept only so bounding-box queries can use a spatial index.
+    geom: Mapped[Any | None] = mapped_column(
+        Geometry("GEOMETRY", srid=WGS84_SRID, spatial_index=False)
+    )
     crs: Mapped[str | None] = mapped_column(String(255))
-    properties: Mapped[dict[str, Any]] = mapped_column(JSON)
+    properties: Mapped[dict[str, Any]] = mapped_column(JSONB)
     status: Mapped[FeatureStatus] = mapped_column(_enum_column(FeatureStatus))
     measurement_type: Mapped[MeasurementType | None] = mapped_column(_enum_column(MeasurementType))
-    value: Mapped[float | None] = mapped_column(Float)
+    value: Mapped[float | None] = mapped_column(Float(53))
     unit: Mapped[str | None] = mapped_column(String(10))
     projected_crs: Mapped[str | None] = mapped_column(String(255))
     error: Mapped[str | None] = mapped_column(Text)

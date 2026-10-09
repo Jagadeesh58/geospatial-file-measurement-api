@@ -1,10 +1,95 @@
+# Local stack: PostgreSQL/PostGIS, Redis, a one-off migration step, the API and a worker.
+# The credentials below are for local development only; set real ones for any shared deployment.
+
+x-app-environment: &app-environment
+  ENVIRONMENT: development
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-geo}:${POSTGRES_PASSWORD:-geo}@db:5432/${POSTGRES_DB:-geo}
+  REDIS_URL: redis://redis:6379/0
+  UPLOAD_DIR: /srv/data/uploads
+  LOG_FORMAT: json
+
 services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-geo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geo}
+      POSTGRES_DB: ${POSTGRES_DB:-geo}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-environment
+    depends_on:
+      db:
+        condition: service_healthy
+
   api:
     build: .
+    environment: *app-environment
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
-      - api-data:/srv/data
+      - uploads:/srv/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.workers.run"]
+    environment: *app-environment
+    volumes:
+      - uploads:/srv/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  reconciler:
+    build: .
+    command: ["python", "-m", "app.workers.reconcile"]
+    environment: *app-environment
+    volumes:
+      - uploads:/srv/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
 volumes:
-  api-data:
+  postgres-data:
+  uploads:

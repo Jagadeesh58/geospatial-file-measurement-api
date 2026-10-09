@@ -1,108 +1,122 @@
-"""Upload processing: loads a dataset, measures each feature and persists the results."""
+"""Upload intake and file queries."""
 
 import logging
+import uuid
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import BinaryIO
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.db.models import FeatureMeasurement, FileStatus, UploadedFile
+from app.core.security import sanitize_filename
+from app.db.models import Feature, ProcessingJob, ProcessingStatus, UploadedFile
+from app.db.repositories import FeatureFilter, FeatureRepository, FileRepository, JobRepository
 from app.services.geospatial import (
-    GeospatialDataset,
-    describe_crs,
+    COPY_CHUNK_BYTES,
+    STORAGE_EXTENSIONS,
+    InvalidGeospatialFile,
     detect_file_type,
-    load_dataset,
+    validate_upload,
 )
-from app.services.measurement import measure_feature
+from app.workers.queue import JobQueue, QueueUnavailableError
 
 logger = logging.getLogger(__name__)
 
-MAX_DISPLAY_FILENAME_LENGTH = 255
-UNEXPECTED_ERROR_MESSAGE = "Unexpected error while processing the file."
+QUEUE_UNAVAILABLE_MESSAGE = "The job queue was unavailable when the upload was accepted."
 
 
-def process_upload(
-    session: Session, filename: str, content: bytes, settings: Settings
+class UploadTooLargeError(Exception):
+    """The upload is larger than the configured limit."""
+
+
+def accept_upload(
+    session: Session, queue: JobQueue, stream: BinaryIO, filename: str, settings: Settings
 ) -> UploadedFile:
-    """Process an upload synchronously.
-
-    Raises InvalidGeospatialFile when the content is rejected; nothing is stored then.
-    """
+    """Validate and store an upload, record it, and queue its processing job."""
     file_type = detect_file_type(filename)
-    dataset = load_dataset(file_type, content, settings)
+    file_id = uuid.uuid4().hex
+    storage_name = f"{file_id}{STORAGE_EXTENSIONS[file_type]}"
+    path = settings.upload_dir / storage_name
 
-    record = UploadedFile(
-        filename=_display_name(filename),
-        file_type=file_type,
-        status=FileStatus.PROCESSING,
-        feature_count=len(dataset.features),
-        crs=describe_crs(dataset.crs),
-    )
-    session.add(record)
-    session.commit()
+    recorded = False
+    try:
+        size_bytes = _store(stream, path, settings.max_upload_bytes)
+        validate_upload(file_type, path, settings)
+
+        record = UploadedFile(
+            id=file_id,
+            filename=sanitize_filename(filename),
+            file_type=file_type,
+            status=ProcessingStatus.PENDING,
+            size_bytes=size_bytes,
+            storage_name=storage_name,
+        )
+        job = ProcessingJob(file_id=file_id, status=ProcessingStatus.PENDING)
+        FileRepository(session).add(record)
+        JobRepository(session).add(job)
+        session.commit()
+        recorded = True
+    finally:
+        if not recorded:
+            path.unlink(missing_ok=True)
 
     try:
-        session.add_all(_measure_features(record.id, dataset))
-        record.status = FileStatus.COMPLETED
+        # Enqueued only after the commit, so the worker always finds the job it is given.
+        queue.enqueue(job.id)
+        job.last_dispatch_attempt_at = datetime.now(UTC)
         session.commit()
-    except Exception:
-        # Broad on purpose: the failure is recorded on the file and then re-raised.
-        session.rollback()
-        logger.exception("Processing failed for uploaded file %s", record.id)
-        _mark_failed(session, record.id)
+    except QueueUnavailableError:
+        _fail_unqueued(session, file_id, path)
         raise
+    logger.info(
+        "upload_accepted",
+        extra={"file_id": file_id, "job_id": job.id, "size_bytes": size_bytes},
+    )
     return record
 
 
 def get_file(session: Session, file_id: str) -> UploadedFile | None:
-    return session.get(UploadedFile, file_id)
+    return FileRepository(session).get(file_id)
 
 
-def list_measurements(session: Session, file_id: str) -> Sequence[FeatureMeasurement]:
-    statement = (
-        select(FeatureMeasurement)
-        .where(FeatureMeasurement.file_id == file_id)
-        .order_by(FeatureMeasurement.feature_index)
+def get_job(session: Session, job_id: str) -> ProcessingJob | None:
+    return JobRepository(session).get(job_id)
+
+
+def list_features(
+    session: Session,
+    file_id: str,
+    filters: FeatureFilter,
+    *,
+    limit: int,
+    offset: int,
+    include_details: bool,
+) -> tuple[Sequence[Feature], int]:
+    return FeatureRepository(session).page(
+        file_id, filters, limit=limit, offset=offset, include_details=include_details
     )
-    return session.scalars(statement).all()
 
 
-def _measure_features(file_id: str, dataset: GeospatialDataset) -> list[FeatureMeasurement]:
-    crs_label = describe_crs(dataset.crs)
-    measurements = []
-    for feature in dataset.features:
-        # Each feature is measured on its own so one bad geometry cannot fail the file.
-        result = measure_feature(feature.geometry, dataset.crs)
-        measurements.append(
-            FeatureMeasurement(
-                file_id=file_id,
-                feature_index=feature.index,
-                geometry_type=feature.geometry.geom_type if feature.geometry else None,
-                geometry=feature.geometry.__geo_interface__ if feature.geometry else None,
-                crs=crs_label,
-                properties=feature.properties,
-                status=result.status,
-                measurement_type=result.measurement_type,
-                value=result.value,
-                unit=result.unit,
-                projected_crs=result.projected_crs,
-                error=result.error,
-            )
-        )
-    return measurements
+def _store(stream: BinaryIO, path: Path, max_bytes: int) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with path.open("wb") as target:
+        while chunk := stream.read(COPY_CHUNK_BYTES):
+            written += len(chunk)
+            if written > max_bytes:
+                raise UploadTooLargeError(f"Uploads are limited to {max_bytes} bytes.")
+            target.write(chunk)
+    if written == 0:
+        raise InvalidGeospatialFile("The uploaded file is empty.")
+    return written
 
 
-def _mark_failed(session: Session, file_id: str) -> None:
-    record = session.get(UploadedFile, file_id)
-    if record is None:
-        return
-    record.status = FileStatus.FAILED
-    record.error = UNEXPECTED_ERROR_MESSAGE
-    session.commit()
-
-
-def _display_name(filename: str) -> str:
-    # Stored for display only; it is never used to build a filesystem path.
-    name = filename.replace("\\", "/").rsplit("/", 1)[-1]
-    return name[:MAX_DISPLAY_FILENAME_LENGTH]
+def _fail_unqueued(session: Session, file_id: str, path: Path) -> None:
+    record = FileRepository(session).get(file_id)
+    if record is not None and record.job is not None:
+        record.status = record.job.status = ProcessingStatus.FAILED
+        record.error = record.job.error = QUEUE_UNAVAILABLE_MESSAGE
+        session.commit()
+    path.unlink(missing_ok=True)

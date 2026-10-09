@@ -44,3 +44,12 @@ def zip_archive(members: dict[str, bytes]) -> bytes:
         for name, content in members.items():
             archive.writestr(name, content)
     return buffer.getvalue()
+
+
+def squares_frame(count: int, side_metres: float = 10.0) -> gpd.GeoDataFrame:
+    """`count` separate squares in UTM 44N, named sq-0, sq-1, ..."""
+    return gpd.GeoDataFrame(
+        {"name": [f"sq-{index}" for index in range(count)]},
+        geometry=[utm_square(side_metres, offset_metres=index * 100.0) for index in range(count)],
+        crs=UTM_44N,
+    )

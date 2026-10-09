@@ -3,24 +3,33 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+venv/
 build/
 dist/
 
-# Tooling caches
+# Test and quality tools
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
 # Local configuration and data
 .env
+.env.*
+!.env.example
 data/*
 !data/.gitkeep
 *.db
+*.sqlite
+*.sqlite3
 *.log
+uploads/
 
-# Editors and OS
+# Editors and operating systems
 .idea/
 .vscode/
 .DS_Store
+Thumbs.db
